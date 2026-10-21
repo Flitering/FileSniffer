@@ -1,0 +1,8 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*_files_report.xlsx
