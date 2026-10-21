@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Check version matches tag
+        shell: bash
+        run: |
+          version=$(python -c "import ast,sys; t=ast.parse(open('FileSniffer.py',encoding='utf-8').read()); print(next(n.value.value for n in t.body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == '__version__'))")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "__version__=$version does not match tag $GITHUB_REF_NAME"; exit 1; }
+
+      - name: Build exe
+        run: pyinstaller --noconfirm --onefile --windowed --name FileSniffer --exclude-module tkinter FileSniffer.py
+
+      - name: Checksum
+        shell: bash
+        run: cd dist && sha256sum FileSniffer.exe > FileSniffer.exe.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/FileSniffer.exe
+            dist/FileSniffer.exe.sha256
+          body_path: RELEASE_NOTES.md

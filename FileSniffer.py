@@ -6,6 +6,8 @@ FileSniffer — анализ папок и архивов, поиск «нева
 """
 import os
 import sys
+import json
+import time
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -18,16 +20,34 @@ from send2trash import send2trash
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableView, QVBoxLayout, QWidget, QPushButton,
     QMessageBox, QFileDialog, QLabel, QHBoxLayout, QHeaderView, QPlainTextEdit,
-    QProgressBar, QLineEdit, QCheckBox, QSplitter, QAbstractItemView
+    QProgressBar, QLineEdit, QCheckBox, QSplitter, QAbstractItemView, QDialog,
+    QDialogButtonBox, QGroupBox, QGridLayout, QSpinBox, QFormLayout
 )
 from PyQt5.QtCore import (
     QSortFilterProxyModel, Qt, QTimer, QThread, pyqtSignal, QItemSelection, QItemSelectionModel
 )
 from PyQt5.QtGui import QStandardItemModel, QStandardItem, QColor, QBrush
 
+__version__ = "1.0.0"
+APP_NAME = "FileSniffer"
+
 # --- Настройки определения файлов ---
-METADATA_EXTENSIONS = {'.tmp', '.db', '.sys', '.ini', '.log'}
-NECESSARY_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.pdf', '.doc', '.docx', '.xls', '.xlsx'}
+# Категории «важных» файлов, из которых пользователь собирает свой набор
+CATEGORIES = {
+    "photos": ("Фото", ".jpg .jpeg .png .gif .bmp .tif .tiff .heic .heif .webp .raw .cr2 .cr3 .nef .arw .dng"),
+    "documents": ("Документы", ".pdf .doc .docx .odt .rtf .djvu .epub .fb2"),
+    "spreadsheets": ("Таблицы и презентации", ".xls .xlsx .xlsm .ods .csv .ppt .pptx .odp"),
+    "video": ("Видео", ".mp4 .mov .avi .mkv .wmv .m4v .3gp .webm .mts"),
+    "audio": ("Музыка и звук", ".mp3 .flac .wav .m4a .aac .ogg .wma .opus"),
+    "design": ("Дизайн и чертежи", ".psd .ai .svg .cdr .indd .fig .sketch .dwg .dxf .blend .fbx .obj"),
+    "code": ("Исходный код", ".py .js .ts .java .cs .cpp .c .h .go .rs .php .rb .sql .ipynb"),
+    "mail": ("Почта и базы", ".pst .ost .eml .msg .mdb .accdb .sqlite .kdbx"),
+}
+DEFAULT_CATEGORIES = ["photos", "documents", "spreadsheets"]
+DEFAULT_METADATA = ".tmp .db .sys .ini .log"
+
+METADATA_EXTENSIONS = set()
+NECESSARY_EXTENSIONS = set()
 ARCHIVE_EXTENSIONS = {'.zip', '.rar', '.7z'}
 PREVIEW_LIMIT = 10
 # Запас свободного места при распаковке (доля от свободного места на диске)
@@ -41,9 +61,73 @@ TYPE_FOLDER = "Папка"
 TYPE_ARCHIVE = "Архив"
 
 COLUMNS = ["Путь к папке", "Количество файлов", "Файлы в папке (первые 10)", "Файлы метаданных",
-           "Общий размер файлов", "Статус", "Тип"]
+           "Размер файлов", "Размер с вложенными", "Изменено", "Статус", "Тип"]
+COL_STATUS = COLUMNS.index("Статус")
 SORT_ROLE = Qt.UserRole
 RECORD_ROLE = Qt.UserRole + 1
+
+
+def parse_extensions(text):
+    """'.jpg, png;  .PDF' -> {'.jpg', '.png', '.pdf'}"""
+    result = set()
+    for token in text.replace(",", " ").replace(";", " ").split():
+        token = token.strip().lower()
+        if token and token != ".":
+            result.add(token if token.startswith(".") else "." + token)
+    return result
+
+
+def format_extensions(exts):
+    return " ".join(sorted(exts))
+
+
+# --- Хранение настроек ---
+
+def settings_path():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, APP_NAME, "settings.json")
+
+
+def default_settings():
+    return {"categories": list(DEFAULT_CATEGORIES), "custom": "", "metadata": DEFAULT_METADATA}
+
+
+def load_settings():
+    settings = default_settings()
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if isinstance(data.get("categories"), list):
+                settings["categories"] = [c for c in data["categories"] if c in CATEGORIES]
+            for key in ("custom", "metadata"):
+                if isinstance(data.get(key), str):
+                    settings[key] = data[key]
+    except (OSError, ValueError):
+        pass
+    return settings
+
+
+def save_settings(settings):
+    p = settings_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def apply_settings(settings):
+    """Пересобирает наборы расширений. Вызывать только когда нет фоновых задач."""
+    necessary = set()
+    for key in settings["categories"]:
+        necessary |= parse_extensions(CATEGORIES[key][1])
+    necessary |= parse_extensions(settings["custom"])
+    NECESSARY_EXTENSIONS.clear()
+    NECESSARY_EXTENSIONS.update(necessary - ARCHIVE_EXTENSIONS)
+    METADATA_EXTENSIONS.clear()
+    METADATA_EXTENSIONS.update(parse_extensions(settings["metadata"]) - NECESSARY_EXTENSIONS)
+
+
+apply_settings(default_settings())
 
 
 def _oem_encoding():
@@ -67,7 +151,9 @@ class Record:
     file_count: int = 0
     files: list = field(default_factory=list)
     metadata_files: list = field(default_factory=list)
-    size: int = 0
+    size: int = 0          # для папки — сумма её файлов, для архива — распакованный размер
+    total_size: int = 0    # место на диске вместе со всем вложенным
+    mtime: float = 0.0     # самое свежее изменение внутри (с учётом вложенного)
     important: bool = False
     nested_protected: bool = False
     encrypted: bool = False
@@ -95,6 +181,10 @@ class Record:
     @property
     def files_preview(self):
         return ', '.join(self.files[:PREVIEW_LIMIT]) + ('...' if self.file_count > PREVIEW_LIMIT else '')
+
+    @property
+    def age_days(self):
+        return (time.time() - self.mtime) / 86400 if self.mtime else 0
 
 
 def ext_of(name):
@@ -129,11 +219,24 @@ def is_inside(child, parent):
         return False
 
 
+def is_risky_root(p):
+    """Корень диска или системная папка — сканировать можно, но удалять оттуда опасно."""
+    p = os.path.normcase(os.path.abspath(p))
+    if os.path.dirname(p) == p:
+        return True
+    system = [os.environ.get(v) for v in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData")]
+    return any(s and (p == os.path.normcase(s) or is_inside(p, s) or is_inside(s, p)) for s in system)
+
+
 def human_size(size):
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
         if size < 1024 or unit == "ТБ":
             return f"{size:.0f} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
         size /= 1024
+
+
+def format_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
 
 
 def zip_member_name(info):
@@ -189,6 +292,11 @@ ARCHIVE_LISTERS = {'.zip': _list_zip, '.rar': _list_rar, '.7z': _list_7z}
 
 def scan_archive(archive_path):
     record = Record(path=archive_path, kind=TYPE_ARCHIVE)
+    try:
+        st = os.stat(archive_path)
+        record.total_size, record.mtime = st.st_size, st.st_mtime
+    except OSError:
+        pass
     lister = ARCHIVE_LISTERS.get(ext_of(archive_path))
     if lister is None:
         record.error = "неподдерживаемый формат"
@@ -218,7 +326,7 @@ def scan_archive(archive_path):
 # --- Сканирование ---
 
 def scan_tree(root_path, on_progress=None, is_cancelled=lambda: False):
-    """Обходит дерево и возвращает список Record для папок и архивов."""
+    """Обходит дерево и возвращает список Record для папок и архивов (None — если отменено)."""
     records = []
     folders = {}
 
@@ -246,9 +354,12 @@ def scan_tree(root_path, on_progress=None, is_cancelled=lambda: False):
             if is_necessary_file(f):
                 rec.important = True
             try:
-                rec.size += os.path.getsize(full)
+                st = os.stat(full)
+                rec.size += st.st_size
+                rec.mtime = max(rec.mtime, st.st_mtime)
             except OSError:
                 pass
+        rec.total_size = rec.size
         records.append(rec)
         folders[os.path.normcase(os.path.normpath(root))] = rec
         if on_progress:
@@ -258,30 +369,43 @@ def scan_tree(root_path, on_progress=None, is_cancelled=lambda: False):
                 return None
             records.append(scan_archive(archive_path))
 
-    _propagate_protection(records, folders, root_path)
+    _propagate(records, folders, root_path)
     return records
 
 
-def _propagate_protection(records, folders, root_path):
-    """Помечает родительские папки, если внутри есть что-то защищённое."""
+def _ancestors(rec_path, folders, root_path):
+    """Записи родительских папок от ближайшей до корня сканирования."""
     root_key = os.path.normcase(os.path.normpath(root_path))
+    parent = os.path.dirname(os.path.normpath(rec_path))
+    while True:
+        key = os.path.normcase(parent)
+        folder = folders.get(key)
+        if folder is not None:
+            yield folder
+        if key == root_key or not is_inside(parent, root_path):
+            return
+        next_parent = os.path.dirname(parent)
+        if next_parent == parent:
+            return
+        parent = next_parent
+
+
+def _propagate(records, folders, root_path):
+    """Поднимает к родителям размер, дату изменения и признак «внутри есть защищённое»."""
     for rec in records:
-        if not (rec.important or rec.encrypted or rec.error or rec.nested_protected):
+        if rec.kind == TYPE_FOLDER and rec.error:
             continue
-        parent = os.path.dirname(os.path.normpath(rec.path))
-        while True:
-            key = os.path.normcase(parent)
-            folder = folders.get(key)
-            if folder is not None:
-                if folder.nested_protected:
-                    break  # выше уже помечено
-                folder.nested_protected = True
-            if key == root_key or not is_inside(parent, root_path):
-                break
-            next_parent = os.path.dirname(parent)
-            if next_parent == parent:
-                break
-            parent = next_parent
+        own = rec.size if rec.kind == TYPE_FOLDER else rec.total_size
+        for folder in _ancestors(rec.path, folders, root_path):
+            folder.total_size += own
+            folder.mtime = max(folder.mtime, rec.mtime)
+    for rec in records:
+        if not (rec.important or rec.encrypted or rec.error):
+            continue
+        for folder in _ancestors(rec.path, folders, root_path):
+            if folder.nested_protected:
+                break  # выше уже помечено
+            folder.nested_protected = True
 
 
 # --- Отчёт ---
@@ -294,13 +418,13 @@ def save_report(records, filename):
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчёт"
-    headers = COLUMNS[:4] + ["Общий размер файлов (байт)"] + COLUMNS[5:]
+    headers = COLUMNS[:4] + ["Размер файлов (байт)", "Размер с вложенными (байт)"] + COLUMNS[6:]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
     for row_idx, rec in enumerate(records, start=2):
         values = [rec.path, rec.file_count, rec.files_preview, ', '.join(rec.metadata_files),
-                  rec.size, rec.status, rec.kind]
+                  rec.size, rec.total_size, format_time(rec.mtime), rec.status, rec.kind]
         for col_idx, value in enumerate(values, start=1):
             cell = ws.cell(row=row_idx, column=col_idx)
             if isinstance(value, int):
@@ -311,7 +435,7 @@ def save_report(records, filename):
                 cell.data_type = "s"
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    for col, width in zip("ABCDEFG", (80, 12, 60, 40, 18, 22, 10)):
+    for col, width in zip("ABCDEFGHI", (80, 12, 60, 40, 18, 22, 17, 22, 10)):
         ws.column_dimensions[col].width = width
     wb.save(filename)
 
@@ -355,10 +479,15 @@ def check_deletable(target, root_path):
 
 def top_level_paths(paths):
     """Оставляет только самые верхние пути: удаление папки удаляет и всё вложенное."""
-    result = []
-    for p in sorted({os.path.normpath(p) for p in paths}, key=len):
-        if not any(p == q or is_inside(p, q) for q in result):
-            result.append(p)
+    # Сортировка по компонентам пути ставит вложенные пути сразу после родителя
+    normalized = sorted({os.path.normpath(p) for p in paths}, key=lambda p: os.path.normcase(p).split(os.sep))
+    result, last = [], None
+    for p in normalized:
+        key = os.path.normcase(p)
+        if last is not None and (key == last or key.startswith(last.rstrip(os.sep) + os.sep)):
+            continue
+        result.append(p)
+        last = key
     return result
 
 
@@ -525,31 +654,101 @@ class ExtractWorker(QThread):
 
 # --- Интерфейс ---
 
+class SettingsDialog(QDialog):
+    """Выбор типов файлов, которые считаются важными и защищают папку от удаления."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Какие файлы считать важными")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+
+        group = QGroupBox("Важные файлы: папка или архив с ними не будут удалены")
+        grid = QGridLayout(group)
+        self.checks = {}
+        for i, (key, (title, exts)) in enumerate(CATEGORIES.items()):
+            cb = QCheckBox(title)
+            cb.setChecked(key in settings["categories"])
+            cb.setToolTip(exts)
+            grid.addWidget(cb, i // 2, i % 2)
+            self.checks[key] = cb
+        layout.addWidget(group)
+
+        form = QFormLayout()
+        self.custom_edit = QLineEdit(settings["custom"])
+        self.custom_edit.setPlaceholderText("например: .dat .bak .sav")
+        form.addRow("Свои важные расширения:", self.custom_edit)
+        self.metadata_edit = QLineEdit(settings["metadata"])
+        form.addRow("Файлы метаданных (для справки):", self.metadata_edit)
+        layout.addLayout(form)
+
+        hint = QLabel("Расширения перечисляются через пробел или запятую. "
+                      "Наведите курсор на категорию, чтобы увидеть её расширения.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).setText("По умолчанию")
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(self.restoreDefaults)
+        layout.addWidget(buttons)
+
+    def restoreDefaults(self):
+        defaults = default_settings()
+        for key, cb in self.checks.items():
+            cb.setChecked(key in defaults["categories"])
+        self.custom_edit.setText(defaults["custom"])
+        self.metadata_edit.setText(defaults["metadata"])
+
+    def accept(self):
+        if not self.settings()["categories"] and not parse_extensions(self.custom_edit.text()):
+            QMessageBox.warning(self, "Настройки", "Выберите хотя бы одну категорию или укажите свои расширения — "
+                                "иначе любые папки будут считаться неважными.")
+            return
+        super().accept()
+
+    def settings(self):
+        return {
+            "categories": [k for k, cb in self.checks.items() if cb.isChecked()],
+            "custom": format_extensions(parse_extensions(self.custom_edit.text())),
+            "metadata": format_extensions(parse_extensions(self.metadata_edit.text())),
+        }
+
+
 class RecordFilterProxy(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
         self.only_deletable = False
+        self.min_age_days = 0
 
     def setOnlyDeletable(self, value):
         self.only_deletable = value
         self.invalidateFilter()
 
+    def setMinAgeDays(self, days):
+        self.min_age_days = days
+        self.invalidateFilter()
+
     def filterAcceptsRow(self, row, parent):
-        if self.only_deletable:
-            rec = self.sourceModel().item(row, 0).data(RECORD_ROLE)
-            if rec.protected:
-                return False
+        rec = self.sourceModel().item(row, 0).data(RECORD_ROLE)
+        if self.only_deletable and rec.protected:
+            return False
+        if self.min_age_days and rec.age_days < self.min_age_days:
+            return False
         return super().filterAcceptsRow(row, parent)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FileSniffer — отчёт по папкам и архивам")
-        self.resize(1300, 850)
+        self.setWindowTitle(f"{APP_NAME} {__version__} — отчёт по папкам и архивам")
+        self.resize(1400, 850)
         self.root_path = ""
         self.records = []
         self.worker = None
+        self.settings = load_settings()
+        apply_settings(self.settings)
 
         self.model = QStandardItemModel()
         self.model.setHorizontalHeaderLabels(COLUMNS)
@@ -574,17 +773,37 @@ class MainWindow(QMainWindow):
         self.rescan_btn = QPushButton("Пересканировать")
         self.rescan_btn.clicked.connect(lambda: self.startScan(self.root_path))
         top_layout.addWidget(self.rescan_btn)
+        self.stop_btn = QPushButton("Остановить")
+        self.stop_btn.clicked.connect(self.stopScan)
+        top_layout.addWidget(self.stop_btn)
+        self.settings_btn = QPushButton("Типы файлов…")
+        self.settings_btn.setToolTip("Выбрать, какие файлы считаются важными")
+        self.settings_btn.clicked.connect(self.editSettings)
+        top_layout.addWidget(self.settings_btn)
         self.folder_label = QLabel("Папка не выбрана")
         top_layout.addWidget(self.folder_label, 1)
+        main_layout.addLayout(top_layout)
+
+        # Фильтры
+        filter_layout = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Поиск по таблице…")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self.proxy.setFilterFixedString)
-        top_layout.addWidget(self.search_edit, 1)
+        self.search_edit.textChanged.connect(self.onFilterChanged)
+        filter_layout.addWidget(self.search_edit, 1)
         self.only_deletable_cb = QCheckBox("Только неважные")
         self.only_deletable_cb.toggled.connect(self.proxy.setOnlyDeletable)
-        top_layout.addWidget(self.only_deletable_cb)
-        main_layout.addLayout(top_layout)
+        self.only_deletable_cb.toggled.connect(self.updateSummary)
+        filter_layout.addWidget(self.only_deletable_cb)
+        filter_layout.addWidget(QLabel("Не изменялись дней:"))
+        self.age_spin = QSpinBox()
+        self.age_spin.setRange(0, 36500)
+        self.age_spin.setSpecialValueText("любые")
+        self.age_spin.setToolTip("Показывать только то, что не менялось указанное число дней (с учётом вложенного)")
+        self.age_spin.valueChanged.connect(self.proxy.setMinAgeDays)
+        self.age_spin.valueChanged.connect(self.updateSummary)
+        filter_layout.addWidget(self.age_spin)
+        main_layout.addLayout(filter_layout)
 
         # Таблица
         self.table = QTableView()
@@ -597,7 +816,7 @@ class MainWindow(QMainWindow):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
-        for col, width in enumerate((520, 90, 300, 200, 110, 160, 60)):
+        for col, width in enumerate((480, 80, 260, 160, 100, 130, 120, 160, 60)):
             self.table.setColumnWidth(col, width)
         self.table.selectionModel().selectionChanged.connect(self.updateSummary)
 
@@ -639,14 +858,46 @@ class MainWindow(QMainWindow):
 
     def setBusy(self, busy):
         has_data = bool(self.records)
+        scanning = isinstance(self.worker, ScanWorker)
         self.choose_btn.setEnabled(not busy)
+        self.settings_btn.setEnabled(not busy)
         self.rescan_btn.setEnabled(not busy and bool(self.root_path))
+        self.stop_btn.setEnabled(busy and scanning)
         for btn in (self.select_non_important_btn, self.delete_button, self.perm_delete_button,
                     self.extract_button, self.report_button):
             btn.setEnabled(not busy and has_data)
 
     def appendLog(self, text):
         self.logTextEdit.appendPlainText(text)
+
+    def onFilterChanged(self, text):
+        self.proxy.setFilterFixedString(text)
+        self.updateSummary()
+
+    # --- Настройки ---
+
+    def editSettings(self):
+        dialog = SettingsDialog(self.settings, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self.settings = dialog.settings()
+        apply_settings(self.settings)
+        try:
+            save_settings(self.settings)
+        except OSError as e:
+            self.appendLog(f"Не удалось сохранить настройки: {e}")
+        self.appendLog(f"Важные расширения: {format_extensions(NECESSARY_EXTENSIONS)}")
+        if self.root_path and QMessageBox.question(
+                self, "Настройки изменены", "Пересканировать папку с новыми настройками?",
+                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.startScan(self.root_path)
+        elif self.records:
+            # Старые статусы больше не соответствуют настройкам — удалять по ним нельзя
+            self.records = []
+            self.model.removeRows(0, self.model.rowCount())
+            self.updateSummary()
+            self.setBusy(False)
+            self.appendLog("Результаты сброшены: пересканируйте папку.")
 
     # --- Сканирование ---
 
@@ -662,13 +913,20 @@ class MainWindow(QMainWindow):
         self.folder_label.setText(self.root_path)
         self.records = []
         self.model.removeRows(0, self.model.rowCount())
-        self.setBusy(True)
         self.progressBar.setRange(0, 0)  # неопределённый прогресс
         self.appendLog(f"Начинаю сканирование: {self.root_path}")
+        if is_risky_root(self.root_path):
+            self.appendLog("Внимание: это корень диска или системная папка. Удаление отсюда может "
+                           "сломать программы — проверяйте выбранное особенно внимательно.")
         self.worker = ScanWorker(self.root_path)
         self.worker.progress.connect(self.onScanProgress)
         self.worker.done.connect(self.onScanFinished)
+        self.setBusy(True)
         self.worker.start()
+
+    def stopScan(self):
+        if isinstance(self.worker, ScanWorker):
+            self.worker.cancel()
 
     def onScanProgress(self, current, count):
         self.statusBar().showMessage(f"Просканировано {count}: {current}")
@@ -676,12 +934,20 @@ class MainWindow(QMainWindow):
     def onScanFinished(self, records):
         self.worker = None
         self.progressBar.setRange(0, 100)
-        self.progressBar.setValue(100)
         self.statusBar().clearMessage()
-        self.records = records or []
-        self.populate()
-        deletable = sum(1 for r in self.records if not r.protected)
-        self.appendLog(f"Сканирование завершено: {len(self.records)} записей, неважных — {deletable}.")
+        if records is None:
+            self.progressBar.setValue(0)
+            self.appendLog("Сканирование остановлено.")
+            self.records = []
+        else:
+            self.progressBar.setValue(100)
+            self.records = records
+            self.populate()
+            deletable = [r for r in self.records if not r.protected and is_inside(r.path, self.root_path)]
+            tops = set(top_level_paths(r.path for r in deletable))
+            freeable = sum(r.total_size for r in deletable if os.path.normpath(r.path) in tops)
+            self.appendLog(f"Сканирование завершено: {len(self.records)} записей, неважных — {len(deletable)} "
+                           f"(можно освободить до {human_size(freeable)}).")
         self.setBusy(False)
 
     def populate(self):
@@ -696,6 +962,8 @@ class MainWindow(QMainWindow):
                 (rec.files_preview, rec.files_preview.lower()),
                 (', '.join(rec.metadata_files), len(rec.metadata_files)),
                 (human_size(rec.size), rec.size),
+                (human_size(rec.total_size), rec.total_size),
+                (format_time(rec.mtime), rec.mtime),
                 (rec.status, rec.status),
                 (rec.kind, rec.kind),
             ]
@@ -711,7 +979,7 @@ class MainWindow(QMainWindow):
                 row.append(item)
             row[0].setData(rec, RECORD_ROLE)
             row[0].setToolTip(rec.path)
-            row[4].setToolTip(f"{rec.size:,} байт".replace(",", " "))
+            row[5].setToolTip(f"{rec.total_size:,} байт".replace(",", " "))
             self.model.appendRow(row)
         self.table.setSortingEnabled(True)
         self.updateSummary()
@@ -727,7 +995,8 @@ class MainWindow(QMainWindow):
 
     def updateSummary(self, *_):
         selected = self.selectedRecords()
-        total = sum(r.size for r in selected)
+        tops = set(top_level_paths(r.path for r in selected))
+        total = sum(r.total_size for r in selected if os.path.normpath(r.path) in tops)
         self.summary_label.setText(f"Выбрано: {len(selected)} ({human_size(total)}) | "
                                    f"Показано: {self.proxy.rowCount()} из {self.model.rowCount()}")
 
@@ -742,21 +1011,21 @@ class MainWindow(QMainWindow):
     # --- Действия ---
 
     def deleteSelected(self, permanent):
-        valid_paths = []
+        candidates = []
         for rec in self.selectedRecords():
             if os.path.normcase(os.path.normpath(rec.path)) == os.path.normcase(self.root_path):
                 self.appendLog(f"Пропущено {rec.path}: родительская папка.")
             elif rec.protected:
                 self.appendLog(f"Пропущено {rec.path}: {rec.status}.")
             else:
-                valid_paths.append(rec.path)
-        valid_paths = top_level_paths(valid_paths)
+                candidates.append(rec)
+        valid_paths = top_level_paths(r.path for r in candidates)
         if not valid_paths:
             QMessageBox.information(self, "Информация",
                                     "Нет элементов для удаления (важные, зашифрованные и нечитаемые элементы защищены).")
             return
-        by_path = {os.path.normpath(r.path): r for r in self.records}
-        total = sum(r.size for p, r in by_path.items() if any(p == v or is_inside(p, v) for v in valid_paths))
+        tops = set(valid_paths)
+        total = sum(r.total_size for r in candidates if os.path.normpath(r.path) in tops)
         if permanent:
             text = (f"Безвозвратно удалить {len(valid_paths)} элемент(ов), примерно {human_size(total)}?\n"
                     "Это действие нельзя отменить.")
@@ -765,13 +1034,13 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "Подтверждение", text, QMessageBox.Yes | QMessageBox.No,
                                 QMessageBox.No) != QMessageBox.Yes:
             return
-        self.setBusy(True)
         self.progressBar.setValue(0)
         self.appendLog("Начинается постоянное удаление..." if permanent else "Начинается удаление (в корзину)...")
         self.worker = DeletionWorker(valid_paths, self.root_path, permanent=permanent)
         self.worker.progress.connect(self.progressBar.setValue)
         self.worker.logMessage.connect(self.appendLog)
         self.worker.done.connect(self.onDeletionFinished)
+        self.setBusy(True)
         self.worker.start()
 
     def onDeletionFinished(self, deleted):
@@ -796,12 +1065,12 @@ class MainWindow(QMainWindow):
         dest = QFileDialog.getExistingDirectory(self, "Выберите папку для распаковки")
         if not dest:
             return
-        self.setBusy(True)
         self.progressBar.setValue(0)
         self.worker = ExtractWorker(paths, dest)
         self.worker.progress.connect(self.progressBar.setValue)
         self.worker.logMessage.connect(self.appendLog)
         self.worker.done.connect(self.onExtractFinished)
+        self.setBusy(True)
         self.worker.start()
 
     def onExtractFinished(self, errors):
@@ -847,6 +1116,8 @@ class MainWindow(QMainWindow):
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
     window = MainWindow()
     window.show()
     if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
